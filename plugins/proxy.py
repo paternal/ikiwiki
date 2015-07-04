@@ -69,6 +69,13 @@ class AlreadyImported (Exception):
     pass
 
 
+class AbortedCall (Exception):
+    """Raised when RPC call has been aborted by Ikiwiki."""
+
+    def __init__(self, line):
+        self.line = line
+
+
 class _IkiWikiExtPluginXMLRPCDispatcher(_xmlrpc_server.SimpleXMLRPCDispatcher):
 
     def __init__(self, allow_none=False, encoding=None):
@@ -181,15 +188,26 @@ class _IkiWikiExtPluginXMLRPCHandler(object):
             self._debug_fn('ikiwiki is going down, and so are we...')
             raise GoingDown()
 
-        data = _xmlrpc_client.loads(xml)[0][0]
+        data = _xmlrpc_client.loads(xml)
+
+        methodname = data[1]
+        if methodname is not None:
+            # We expected an answer to our RCP call, but an error occured on
+            # the ikiwiki side, and Ikiwiki is cancelling this request, and
+            # doing a new one.
+            raise AbortedCall(xml)
+
         self._debug_fn(
             'parsed data from response to procedure {0}: [{1}]'.format(
-                cmd, repr(data)))
-        return data
+                cmd, repr(data[0][0])))
+        return data[0][0]
 
-    def handle_rpc(self, in_fd, out_fd):
+    def handle_rpc(self, in_fd, out_fd, first_line):
         self._debug_fn('waiting for procedure calls from ikiwiki...')
-        xml = _IkiWikiExtPluginXMLRPCHandler._read(in_fd)
+        if first_line is None:
+            xml = _IkiWikiExtPluginXMLRPCHandler._read(in_fd)
+        else:
+            xml = XMLStreamParser().parse(first_line)
         if xml is None:
             # ikiwiki is going down
             self._debug_fn('ikiwiki is going down, and so are we...')
@@ -313,9 +331,19 @@ class IkiWikiProcedureProxy(object):
 
     def run(self):
         try:
+            first_line = None
             while True:
-                ret = self._xmlrpc_handler.handle_rpc(
-                    self._in_fd, self._out_fd)
+                try:
+                    ret = self._xmlrpc_handler.handle_rpc(
+                        self._in_fd, self._out_fd,
+                        first_line=first_line)
+                    first_line = None
+                except AbortedCall as error:
+                    # Current call has been aborted on the Ikiwiki side: we
+                    # received a method call instead of the answer we were
+                    # expecting. So we begin handling a new request, and the
+                    # first line of this request is the `error.line`.
+                    first_line = error.line
                 time.sleep(IkiWikiProcedureProxy._LOOP_DELAY)
         except GoingDown:
             return
